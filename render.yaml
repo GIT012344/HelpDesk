@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: line-helpdesk
+    env: docker
+    plan: free
+    autoDeploy: true
+    region: oregon
+    dockerContext: .
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/credentials.json
+      - key: CHANNEL_ACCESS_TOKEN
+        value: 0wrW85zf5NXhGWrHRjwxitrZ33JPegxtB749lq9TWRlrlCvfl0CKN9ceTw+kzPqBc6yjEOlV3EJOqUsBNhiFGQu3asN1y6CbHIAkJINhHNWi5gY9+O3+SnvrPaZzI7xbsBuBwe8XdIx33wdAN+79bgdB04t89/1O/w1cDnyilFU=
+    secretFiles:
+      - name: credentials.json
+        path: credentials.json
