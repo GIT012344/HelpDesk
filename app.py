@@ -2,19 +2,23 @@ from flask import Flask, request, jsonify
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs
 import traceback
 import re
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+from flask_socketio import SocketIO
+from threading import Lock
 
 CONTACT_STATE = "contact_conversation"
-
+load_dotenv()
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-CHANNEL_ACCESS_TOKEN = 'RF7HySsgh8pRmAW3UgwHu4fZ7WWyokBrrs1Ewx7tt8MJ47eFqlnZ4eOZnEg2UFZH++4ZW0gfRK/MLynU0kANOEq23M4Hqa6jdGGWeDO75TuPEEZJoHOw2yabnaSDOfhtXc9GzZdXW8qoVqFnROPhegdB04t89/1O/w1cDnyilFU='
+CHANNEL_ACCESS_TOKEN = 'O02yXH2dlIyu9da3bJPfhtHTZYkDJR/wy1TnWj5ZAgBUr0zfiNrY9mC3qm5nEWyILuI+rcVftmsvsQZp+AB8Hf6f5UmDosjtkQY0ufX+JrVwa3i+UwlAXa7UvBQ/JBef2pRD4wJ3QttJyLn1nfh1dQdB04t89/1O/w1cDnyilFU='
 
 LINE_HEADERS = {
     'Content-Type': 'application/json',
@@ -22,6 +26,7 @@ LINE_HEADERS = {
 }
 
 user_states = {}
+user_states_lock = Lock()
 
 # ฟังก์ชันช่วยเหลือใหม่
 def info_row(label, value):
@@ -70,6 +75,22 @@ def status_row(label, value, color):
         ]
     }
 
+def safe_datetime_to_string(dt_value, default_format="%Y-%m-%d %H:%M:%S"):
+    """แปลง datetime object เป็น string อย่างปลอดภัย"""
+    if dt_value is None:
+        return "ไม่มีข้อมูล"
+    if hasattr(dt_value, 'strftime'):  # ถ้าเป็น datetime object
+        return dt_value.strftime(default_format)
+    return str(dt_value)
+
+def safe_dict_value(value, default="ไม่มีข้อมูล"):
+    """แปลงค่าใน dict เป็น string อย่างปลอดภัย"""
+    if value is None:
+        return default
+    if hasattr(value, 'strftime'):  # ถ้าเป็น datetime object
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
 @app.route("/", methods=["GET"])
 def home():
     return "✅ LINE Helpdesk is running.", 200
@@ -77,27 +98,60 @@ def home():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        # First check if there's any data
         if not request.data:
             return jsonify({"status": "error", "message": "No data received"}), 400
-
         try:
             payload = request.get_json()
         except Exception as e:
             print(f"❌ JSON decode error: {str(e)}")
             return jsonify({"status": "error", "message": "Invalid JSON"}), 400
-
         if payload is None:
             return jsonify({"status": "error", "message": "Empty JSON"}), 400
-
         events = payload.get('events', [])
-        
         for event in events:
+            # --- เพิ่ม welcome quick reply เมื่อเริ่มแชท ---
+            if event.get('type') == 'follow':
+                user_id = event['source']['userId']
+                welcome_message = {
+                    "type": "text",
+                    "text": "ยินดีต้อนรับสู่ระบบ Helpdesk\nกรุณาเลือกบริการที่ต้องการ:",
+                    "quickReply": get_welcome_quick_reply()
+                }
+                send_reply_message(event['replyToken'], [welcome_message])
+                continue
             if event.get('type') == 'message' and event['message'].get('type') == 'text':
-                handle_text_message(event)
+                with user_states_lock:
+                    handle_text_message(event)
+                    user_id = event['source'].get('userId')
+                    message_text = event['message'].get('text')
+                    ticket_id = None
+                    try:
+                        conn = get_db_connection()
+                        cur = conn.cursor()
+                        cur.execute("SELECT ticket_id FROM tickets WHERE user_id = %s ORDER BY created_at DESC LIMIT 1", (user_id,))
+                        row = cur.fetchone()
+                        if row:
+                            if isinstance(row, dict):
+                                ticket_id = row.get('ticket_id')
+                            elif isinstance(row, tuple):
+                                ticket_id = row[0]
+                            else:
+                                ticket_id = None
+                        cur.close()
+                        conn.close()
+                    except Exception:
+                        ticket_id = None
+                    if ticket_id:
+                        socketio.emit('new_message', {
+                            'ticket_id': ticket_id,
+                            'admin_id': None,
+                            'sender_name': 'LINE User',
+                            'message': message_text,
+                            'is_admin_message': False
+                        })
             elif event.get('type') == 'postback':
-                handle_postback(event)
-                
+                with user_states_lock:
+                    handle_postback(event)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         print("❌ ERROR in webhook():", e)
@@ -122,14 +176,20 @@ def handle_postback(event):
             if selected_date:
                 selected_datetime = datetime.strptime(selected_date, "%Y-%m-%d")
                 today = datetime.now().date()
+                # ตรวจสอบว่าวันที่เลือกไม่ใช่วันในอดีต
                 if selected_datetime.date() < today:
-                    reply(reply_token, "⚠️ กรุณาเลือกวันใหม่ ไม่สามารถเลือกวันนี้ได้ โปรดดเลือกวันที่เป็นปัจจุบันหรืออนาคต")
+                    reply(reply_token, "⚠️ ไม่สามารถเลือกวันที่ผ่านมาแล้ว กรุณาเลือกวันที่เป็นปัจจุบันหรืออนาคต")
                     return
-                # แปลงรูปแบบวันที่เพื่อแสดงผล
-                formatted_date = selected_datetime.strftime("%d/%m/%Y")
+                # ถ้าเลือกวันปัจจุบัน ให้บันทึกเวลาปัจจุบันไว้ใน state
+                if selected_datetime.date() == today:
+                    current_time = datetime.now().time()
+                    user_states[user_id]["current_time"] = current_time.strftime("%H:%M")
+                else:
+                    user_states[user_id].pop("current_time", None)
                 user_states[user_id]["selected_date"] = selected_date
-                send_time_picker(reply_token, formatted_date)
-                
+                formatted_date = selected_datetime.strftime("%d/%m/%Y")
+                send_time_picker(reply_token, formatted_date, user_id)
+        
         if action == "view_history":
             selected_date = params.get('date', '')
             ticket_id = data_dict.get('ticket_id', [''])[0]
@@ -168,7 +228,7 @@ def show_monthly_history(reply_token, user_id, selected_date, ticket_id=None):
             try:
                 ticket_date = datetime.strptime(ticket['date'], "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y %H:%M")
             except:
-                ticket_date = ticket['date']
+                ticket_date = str(ticket['date'])
             
             bubble = {
                 "type": "bubble",
@@ -252,10 +312,62 @@ def handle_text_message(event):
     reply_token = event['replyToken']
     user_id = event['source']['userId']
     
+    # รายการคำสั่งที่ใช้ยกเลิกการทำงานปัจจุบัน
+    cancel_keywords = ["จบ", "ยกเลิก", "cancel", "ออก", "end", "stop"]
+    
+    # --- ตรวจสอบการเรียกใช้เมนูซ้อนกัน ---
+    if user_id in user_states and user_states[user_id].get("step") not in [None, ""]:
+        # ถ้าผู้ใช้พยายามยกเลิกการทำงานปัจจุบัน
+        if any(user_message.startswith(kw) for kw in cancel_keywords):
+            del user_states[user_id]
+            reply(reply_token, "✅ การดำเนินการปัจจุบันถูกยกเลิกแล้ว คุณสามารถเลือกบริการใหม่ได้")
+            return
+        
+        # ตรวจสอบว่าผู้ใช้พยายามเรียกเมนูใหม่ขณะที่ยังมีเมนูที่ทำงานอยู่
+        menu_keywords = ["เช็กสถานะ", "ติดต่อเจ้าหน้าที่", "แจ้งปัญหา", 
+                        "นัดหมายเวลา", "Helpdesk", ]
+        
+        if any(kw in user_message for kw in menu_keywords):
+            current_service = user_states[user_id].get("service_type", "บริการปัจจุบัน")
+            reply(reply_token, 
+                f"⚠️ คุณกำลังใช้งาน '{current_service}' อยู่\n\n"
+                "กรุณาดำเนินการให้เสร็จสิ้นก่อน หรือพิมพ์ 'จบ' เพื่อออกจากการบริการนี้\n"
+                "ก่อนเลือกบริการอื่น")
+            return
+    
+    # --- ตรวจสอบคำสั่งยกเลิก ---
+    if any(user_message.startswith(kw) for kw in cancel_keywords):
+        if user_id in user_states:
+            del user_states[user_id]
+        reply(reply_token, "✅ สิ้นสุดการสนทนา")
+        return
+    
+    # --- ส่วนเดิมของฟังก์ชัน handle_text_message ---
     reset_keywords = ["สมัครสมาชิก", "เช็กสถานะ", "ติดต่อเจ้าหน้าที่", "ยกเลิก"]
+    
+    # --- เพิ่มการตรวจสอบ state สำหรับปัญหาอื่นๆ ---
+    if user_id in user_states and user_states[user_id].get("step") == "ask_custom_issue":
+        user_states[user_id]["issue_text"] = user_message
+        user_states[user_id]["step"] = "ask_custom_issue_details"
+        reply(reply_token, "📝 กรุณากรอกรายละเอียดย่อยของปัญหาที่แจ้ง (เช่น อุปกรณ์ที่เกี่ยวข้อง, สถานที่เกิดปัญหา, อาการที่สังเกตเห็น)")
+        return
+    if user_id in user_states and user_states[user_id].get("step") == "ask_custom_issue_details":
+        user_states[user_id]["subgroup"] = user_message
+        user_states[user_id]["step"] = "pre_helpdesk"
+        confirm_msg = create_confirm_message(
+            "helpdesk",
+            f"แจ้งปัญหา: {user_states[user_id]['issue_text']}\n"
+            f"รายละเอียดย่อย: {user_message}"
+        )
+        send_reply_message(reply_token, [confirm_msg])
+        return
+    # เพิ่มการเช็ค state 'ask_custom_request' สำหรับ Service
+    if user_id in user_states and user_states[user_id].get("step") == "ask_custom_request":
+        handle_custom_request(reply_token, user_id, user_message)
+        return
+    
     if user_id in user_states and any(user_message.startswith(k) for k in reset_keywords):
         del user_states[user_id]
-    
     
     if user_message.startswith(("confirm_", "cancel_")):
         handle_confirmation(event)
@@ -264,31 +376,21 @@ def handle_text_message(event):
     if user_id in user_states and user_states[user_id].get("step") == CONTACT_STATE:
         if not check_existing_user(user_id):
             del user_states[user_id]
-            reply(reply_token, "⚠️ กรุณาสมัครสมาชิกหรือเข้าสู่ระบบใหม่")
+            reply(reply_token, "⚠️ กรุณาสมัครสมาชิกหรือเข้าสู่ระบบใหม่ โดยเลือกไปที่เมนูและเลือกแจ้งปัญหาเพื่อลงทะเบียน")
             return
-        
-        if user_message.lower() in ["end", "จบ", "หยุด", "เสร็จสิ้น", "แจ้งปัญหา", "ยกเลิก","เช็กสถานะ"]:
+        if user_message.strip().lower() in ["จบ", "end", "หยุด", "เสร็จสิ้น"]:
             del user_states[user_id]
             reply(reply_token, "✅ การสนทนากับเจ้าหน้าที่ได้สิ้นสุดลง ขอบคุณที่ใช้บริการ")
             return
-        else:
-            # บันทึกข้อมูลชั่วคราวก่อน confirm
-            user_states[user_id]["contact_message"] = user_message
-            user_states[user_id]["step"] = "pre_contact"
-            
-            # ส่ง Confirm Message
-            confirm_msg = create_confirm_message(
-                "contact",
-                f"ข้อความ: {user_message}"
-            )
-            send_reply_message(reply_token, [confirm_msg])
-            return
-        
+        # บันทึกข้อความทันที ไม่ต้อง confirm
+        save_contact_message(user_id, user_message, is_user=True)
+        reply(reply_token, "📩 ข้อความของคุณถูกส่งถึงเจ้าหน้าที่แล้ว รอการตอบกลับ หรือพิมพ์ 'จบ' เพื่อออกจากโหมดสนทนา")
+        return
+    
     if user_message == "ติดต่อเจ้าหน้าที่":
         if not check_existing_user(user_id):
-            reply(reply_token, "⚠️ กรุณาสมัครสมาชิกหรือเข้าสู่ระบบก่อนใช้งานบริการนี้")
+            reply(reply_token, "⚠️ กรุณาสมัครสมาชิกโดยเลือกเมนูแจ้งปัญหา เพื่อเริ่มการใช้งานบริการอื่นๆ")
             return
-        
         user_states[user_id] = {
             "step": CONTACT_STATE,
             "service_type": "Contact",
@@ -297,16 +399,6 @@ def handle_text_message(event):
         quick_reply = {
             "type": "text",
             "text": "พิมพ์ข้อความที่ต้องการส่งถึงเจ้าหน้าที่ ผ่านช่อง chat",
-            "quickReply": {
-                "items": [{
-                    "type": "action",
-                    "action": {
-                        "type": "message",
-                        "label": "จบการสนทนา",
-                        "text": "จบ"
-                    }
-                }]
-            }
         }
         send_reply_message(reply_token, [quick_reply])
         return
@@ -321,8 +413,20 @@ def handle_text_message(event):
         if user_states[user_id].get("step") == "ask_request":
             handle_user_request(reply_token, user_id, user_message)
             return
+        if user_states[user_id].get("step") == "ask_subgroup":
+            handle_service_subgroup(reply_token, user_id, user_message)
+            return
+        if user_states[user_id].get("step") == "ask_custom_subgroup":
+            handle_custom_subgroup(reply_token, user_id, user_message)
+            return
         if user_states[user_id].get("step") == "ask_helpdesk_issue":
             handle_helpdesk_issue(reply_token, user_id, user_message)
+            return
+        if user_states[user_id].get("step") == "ask_helpdesk_subgroup":
+            handle_helpdesk_subgroup(reply_token, user_id, user_message)
+            return
+        if user_states[user_id].get("step") == "ask_custom_helpdesk_subgroup":
+            handle_custom_helpdesk_subgroup(reply_token, user_id, user_message)
             return
         if user_states[user_id].get("step") == "ask_appointment" and "selected_date" in user_states[user_id]:
             if user_message == "กรอกเวลาเอง":
@@ -332,14 +436,23 @@ def handle_text_message(event):
                 start_time, end_time = user_message.split('-')
                 if validate_time(start_time) and validate_time(end_time):
                     if is_time_before(start_time, end_time):
-                        selected_date = user_states[user_id]["selected_date"]
-                        appointment_datetime = f"{selected_date} {user_message}"
-                        handle_save_appointment(reply_token, user_id, appointment_datetime)
-                    else:
-                        reply(reply_token, "⚠️ เวลาเริ่มต้นต้องน้อยกว่าเวลาสิ้นสุด")
+                        # ตรวจสอบว่าวันที่เลือกเป็นวันนี้หรือไม่
+                        if "selected_date" in user_states[user_id]:
+                            selected_date = datetime.strptime(user_states[user_id]["selected_date"], "%Y-%m-%d").date()
+                            today = datetime.now().date()
+                            if selected_date == today:
+                                current_time = datetime.now().time()
+                                start_time_obj = datetime.strptime(start_time, "%H:%M").time()
+                                if start_time_obj < current_time:
+                                    reply(reply_token, f"⚠️ ไม่สามารถเลือกเวลาที่ผ่านมาแล้ว (เวลาปัจจุบัน: {current_time.strftime('%H:%M')})")
+                                    return
+                    appointment_datetime = f"{user_states[user_id]['selected_date']} {user_message}"
+                    handle_save_appointment(reply_token, user_id, appointment_datetime)
                 else:
-                    reply(reply_token, "⚠️ รูปแบบเวลาไม่ถูกต้อง กรุณากรอกในรูปแบบ HH:MM-HH:MM\nเช่น 11:30-12:45")
-                return
+                    reply(reply_token, "⚠️ เวลาเริ่มต้นต้องน้อยกว่าเวลาสิ้นสุด")
+            else:
+                reply(reply_token, "⚠️ รูปแบบเวลาไม่ถูกต้อง กรุณากรอกในรูปแบบ HH:MM-HH:MM\nเช่น 11:30-12:45")
+            return
                 
         handle_user_state(reply_token, user_id, user_message)
         return
@@ -351,7 +464,25 @@ def handle_text_message(event):
     elif user_message == "เช็กสถานะ" or user_message == "ดู Ticket ล่าสุด":
         check_latest_ticket(reply_token, user_id)
     elif user_message.startswith("สมัครสมาชิก"):
-        handle_register(reply_token, user_id, user_message)
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("สมัคร"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("reg"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("register"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("ลงทะเบียน"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("Reg"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("Register"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("ล็อคอิน"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("Login"):
+        handle_report_issue(reply_token, user_id)
+    elif user_message.startswith("login"):
+        handle_report_issue(reply_token, user_id)
     elif user_message == "นัดหมายเวลา":
         handle_appointment(reply_token, user_id)
     elif user_message == "Helpdesk":
@@ -360,13 +491,26 @@ def handle_text_message(event):
         handle_appointment_time(reply_token, user_id, user_message)
     elif re.search(r"TICKET-\d{14}", user_message):
         match = re.search(r"(TICKET-\d{14})", user_message)
-        ticket_id = match.group(1)
-        show_ticket_details(reply_token, ticket_id, user_id)
+        if match:
+            ticket_id = match.group(1)
+            show_ticket_details(reply_token, ticket_id, user_id)
+        else:
+            reply(reply_token, "ไม่พบ Ticket ID ที่ระบุ")
+        return
     elif user_message.startswith("ดูรายละเอียด "):
         ticket_id = user_message.replace("ดูรายละเอียด ", "").strip()
         show_ticket_details(reply_token, ticket_id, user_id)
+    elif user_id in user_states and user_states[user_id].get("step") == "ask_custom_request":
+        handle_custom_request(reply_token, user_id, user_message)
+        return
     else:
-        reply(reply_token, "📌 ไปที่เมนูและเลือกบริการ")
+        # เมื่อผู้ใช้พิมพ์ข้อความที่ไม่รู้จัก ให้แสดงเมนูหลัก
+        reply_message = {
+            "type": "text",
+            "text": "กรุณาเลือกบริการที่ต้องการจากเมนูด้านล่าง:",
+            "quickReply": get_main_menu_quick_reply()
+        }
+        send_reply_message(reply_token, [reply_message])
 
 def handle_confirmation(event):
     """จัดการการยืนยันจากผู้ใช้"""
@@ -375,7 +519,7 @@ def handle_confirmation(event):
     user_id = event['source']['userId']
     
     if user_id not in user_states:
-        reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
+        reply(reply_token, "⚠️โปรดเลือกเมนูบริการ เพื่อเริ่มกระบวนการใหม่")
         return
     
     if user_message.startswith("confirm_"):
@@ -404,7 +548,8 @@ def handle_confirmation(event):
                     state.get("department", ""),
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    state.get("issue_text", "")
+                    state.get("issue_text", ""),
+                    state.get("subgroup", "")  # เพิ่ม subgroup
                 )
                 
                 if success:
@@ -438,7 +583,8 @@ def handle_confirmation(event):
                     state.get("phone", ""),
                     state.get("department", ""),
                     state.get("appointment_datetime", ""),
-                    state.get("request_text", "")
+                    state.get("request_text", ""),
+                    state.get("subgroup", "")  # เพิ่ม subgroup
                 )
                 
                 if success:
@@ -473,35 +619,64 @@ def handle_confirmation(event):
         reply(reply_token, "❌ การดำเนินการถูกยกเลิก")
 
 def save_contact_message(user_id, message, is_user=False, is_system=False):
-    """บันทึกข้อความใน Textbox พร้อมระบุประเภท"""
+    """บันทึกข้อความใน Textbox พร้อมระบุประเภท และ insert ลง messages"""
     try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("Tickets").sheet1
-        
-        # หาแถวที่มี User ID นี้อยู่
-        cell = sheet.find(str(user_id))
-        if not cell:
+        from datetime import datetime, timezone
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # หา Ticket ล่าสุดของผู้ใช้
+        cur.execute("SELECT * FROM tickets WHERE user_id = %s ORDER BY created_at DESC LIMIT 1", (user_id,))
+        row = cur.fetchone()
+        if not row:
             print(f"❌ ไม่พบผู้ใช้ {user_id} ในระบบ")
             return False
-        
-        # อ่านค่าเดิมและเพิ่มข้อความใหม่
-        current_text = sheet.cell(cell.row, 13).value or ""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+        # รองรับ row เป็น dict หรือ tuple
+        def get_row_value(row, key, default=None):
+            if row is None:
+                return default
+            if isinstance(row, dict):
+                return row.get(key, default)
+            elif isinstance(row, tuple) and hasattr(cur, 'description') and cur.description is not None:
+                columns = [desc[0] for desc in cur.description]
+                if key in columns:
+                    return row[columns.index(key)]
+                return default
+            return default
+        current_text = get_row_value(row, 'textbox', "") or ""
+        # --- ปรับ timestamp เป็น UTC string ไม่มี microseconds เฉพาะข้อความจาก LINE ---
+        timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         new_text = f"{message}"
-        
-        # ตัดข้อความให้เหลือไม่เกิน 50000 ตัวอักษร
         if len(new_text) > 50000:
             new_text = new_text[-50000:]
-        
-        sheet.update_cell(cell.row, 13, new_text)
-        
-        # อัพเดทสถานะเป็น "กำลังดำเนินการ" หากเป็นข้อความจากผู้ใช้
-        if is_user:
-            sheet.update_cell(cell.row, 8, "None")
-        
+        cur.execute("UPDATE tickets SET textbox = %s WHERE ticket_id = %s", (new_text, get_row_value(row, 'ticket_id')))
+        ticket_id = get_row_value(row, 'ticket_id')
+        sender_name = get_row_value(row, 'name') or "User"
+        cur.execute(
+            """
+            INSERT INTO messages (ticket_id, sender_name, message, is_admin_message, user_id, line_id, platform, timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                ticket_id,
+                sender_name,
+                message,
+                False,
+                user_id,
+                user_id,
+                "LINE",
+                timestamp
+            )
+        )
+        conn.commit()
+        socketio.emit('new_message', {
+            'ticket_id': ticket_id,
+            'admin_id': None,
+            'sender_name': sender_name,
+            'message': message,
+            'is_admin_message': False
+        })
+        cur.close()
+        conn.close()
         return True
     except Exception as e:
         print(f"❌ Error saving contact message: {e}")
@@ -509,29 +684,72 @@ def save_contact_message(user_id, message, is_user=False, is_system=False):
         return False
 
 def save_contact_request(user_id, message):
-    """บันทึกคำขอติดต่อเจ้าหน้าที่ลง Google Sheet"""
+    """บันทึกคำขอติดต่อเจ้าหน้าที่ลง Google Sheet และ insert ลง messages ด้วย"""
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
         client = gspread.authorize(creds)
         sheet = client.open("Tickets").sheet1
-        
-        # หาแถวที่มี User ID นี้อยู่
         cell = sheet.find(user_id)
         if not cell:
             return False
-        
-        # อัพเดทคอลัมน์ Textbox (คอลัมน์ที่ 13)
         current_text = sheet.cell(cell.row, 13).value or ""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         new_text = f"{current_text}[ผู้ใช้]{timestamp}: {message}"
-        
-        # ตัดข้อความให้เหลือไม่เกิน 50000 ตัวอักษร (Limit ของ Google Sheets)
         if len(new_text) > 50000:
             new_text = new_text[-50000:]
-        
         sheet.update_cell(cell.row, 13, new_text)
         print(f"✅ บันทึกคำขอติดต่อเจ้าหน้าที่สำหรับ User ID: {user_id}")
+        # --- เพิ่ม insert ลง messages ---
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM tickets WHERE user_id = %s ORDER BY created_at DESC LIMIT 1", (user_id,))
+            row = cur.fetchone()
+            def get_row_value(row, key, default=None):
+                if row is None:
+                    return default
+                if isinstance(row, dict):
+                    return row.get(key, default)
+                elif isinstance(row, tuple) and hasattr(cur, 'description') and cur.description is not None:
+                    columns = [desc[0] for desc in cur.description]
+                    if key in columns:
+                        return row[columns.index(key)]
+                    return default
+                return default
+            ticket_id = get_row_value(row, 'ticket_id') if row else None
+            sender_name = get_row_value(row, 'name') if row and get_row_value(row, 'name') else "User"
+            if ticket_id:
+                cur.execute(
+                    """
+                    INSERT INTO messages (ticket_id, sender_name, message, is_admin_message, user_id, line_id, platform, timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        ticket_id,
+                        sender_name,
+                        message,
+                        False,
+                        user_id,
+                        user_id,
+                        "LINE",
+                        timestamp
+                    )
+                )
+                conn.commit()
+                # --- emit socket event ---
+                socketio.emit('new_message', {
+                    'ticket_id': ticket_id,
+                    'admin_id': None,
+                    'sender_name': sender_name,
+                    'message': message,
+                    'is_admin_message': False
+                })
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error saving message to messages table: {e}")
+            traceback.print_exc()
         return True
     except Exception as e:
         print("❌ Error saving contact request:", e)
@@ -552,7 +770,6 @@ def handle_appointment_time(reply_token, user_id, user_message):
     # ดึงข้อมูลจาก state
     state = user_states[user_id]
     ticket_id = state["ticket_id"]
-    
     # แยกเวลาจากข้อความ
     if user_message.startswith("นัดหมายเวลา "):
         appointment_time = user_message.replace("นัดหมายเวลา ", "").strip()
@@ -564,18 +781,34 @@ def handle_appointment_time(reply_token, user_id, user_message):
         if not re.fullmatch(r"\d{2}:\d{2}-\d{2}:\d{2}", user_message):
             reply(reply_token, "⚠️ กรุณากรอกเวลาในรูปแบบ HH:MM-HH:MM เช่น 13:00-14:00")
             return
-        appointment_time = user_message
-    
+        start_time, end_time = user_message.split('-')
+        if validate_time(start_time) and validate_time(end_time):
+            if is_time_before(start_time, end_time):
+                # ตรวจสอบว่าวันที่เลือกเป็นวันนี้หรือไม่
+                if "selected_date" in state:
+                    selected_date = datetime.strptime(state["selected_date"], "%Y-%m-%d").date()
+                    today = datetime.now().date()
+                    if selected_date == today:
+                        current_time = datetime.now().time()
+                        start_time_obj = datetime.strptime(start_time, "%H:%M").time()
+                        if start_time_obj < current_time:
+                            reply(reply_token, f"⚠️ ไม่สามารถเลือกเวลาที่ผ่านมาแล้ว (เวลาปัจจุบัน: {current_time.strftime('%H:%M')})")
+                            return
+                appointment_time = user_message
+            else:
+                reply(reply_token, "⚠️ เวลาเริ่มต้นต้องน้อยกว่าเวลาสิ้นสุด")
+                return
+        else:
+            reply(reply_token, "⚠️ รูปแบบเวลาไม่ถูกต้อง กรุณากรอกในรูปแบบ HH:MM-HH:MM เช่น 13:00-14:00")
+            return
     # บันทึกลง Google Sheet
     success = save_appointment_to_sheet(ticket_id, appointment_time)
     if success:
         reply(reply_token, f"✅ นัดหมายเวลา {appointment_time} สำเร็จสำหรับ Ticket {ticket_id}")
-        
         # ส่งสรุปการนัดหมาย
         send_appointment_summary(user_id, ticket_id, appointment_time)
     else:
         reply(reply_token, "❌ เกิดปัญหาในการบันทึกเวลานัดหมาย")
-    
     del user_states[user_id]
 
 def send_appointment_summary(user_id, ticket_id, appointment_datetime):
@@ -693,7 +926,7 @@ def handle_ask_issue(reply_token, user_id, user_message, state):
     
     state["issue"] = email
     state["step"] = "ask_category"
-    reply(reply_token, "📂 กรุณาบอกชื่อผู้ใช้")
+    reply(reply_token, "📂 กรุณากรอกชื่อ-นามสกุล")
 
 def handle_ask_category(reply_token, user_id, user_message, state):
     state["category"] = user_message
@@ -704,7 +937,7 @@ def handle_ask_department(reply_token, user_id, user_message, state):
     if user_message in ["ผู้บริหาร/เลขานุการ", "ส่วนงานตรวจสอบภายใน", "ส่วนงานกฏหมาย", "งานสื่อสารองค์การ", "ฝ่ายนโยบายและแผน", "ฝ่ายเทคโนโลยีสารสนเทศ", "ฝ่ายบริหาร","ฝ่ายบริหารวิชาการและพัฒนาผู้ประกอบการ", "ฝ่ายตรวจสอบโลหะมีค่า", "ฝ่ายตรวจสอบอัญมณีและเครื่องประดับ", "ฝ่ายวิจัยและพัฒนามาตรฐาน", "ฝ่ายพัฒนาธุรกิจ"]:
         state["department"] = user_message
         state["step"] = "ask_phone"
-        reply(reply_token, "📞 กรุณาบอกเบอร์ติดต่อกลับ")
+        reply(reply_token, "📞 กรุณากรอกเบอร์ติดต่อกลับ")
     else:
         reply(reply_token, "กรอกแผนกที่ต้องการ เช่น ผู้บริหาร/เลขานุการ, ส่วนงานตรวจสอบภายใน, ส่วนงานกฏหมาย, งานสื่อสารองค์การ, ฝ่ายนโยบายและแผน, ฝ่ายเทคโนโลยีสารสนเทศ, ฝ่ายบริหาร,ฝ่ายบริหารวิชาการและพัฒนาผู้ประกอบการ, ฝ่ายตรวจสอบโลหะมีค่า, ฝ่ายตรวจสอบอัญมณีและเครื่องประดับ, ฝ่ายวิจัยและพัฒนามาตรฐาน, ฝ่ายพัฒนาธุรกิจ")
         send_department_quick_reply(reply_token)
@@ -726,6 +959,15 @@ def handle_ask_phone(reply_token, user_id, user_message, state):
     del user_states[user_id]
 
 def handle_report_issue(reply_token, user_id):
+    """เริ่มกระบวนการสมัครสมาชิกหรือแจ้งปัญหา"""
+    # ตรวจสอบว่ามีเมนูอื่นทำงานอยู่หรือไม่
+    if user_id in user_states and user_states[user_id].get("step") not in [None, ""]:
+        current_service = user_states[user_id].get("service_type", "บริการปัจจุบัน")
+        reply(reply_token, 
+            f"⚠️ คุณกำลังใช้งาน '{current_service}' อยู่\n\n"
+            "กรุณาดำเนินการให้เสร็จสิ้นก่อน หรือพิมพ์ 'ยกเลิก' เพื่อออกจากการบริการนี้\n"
+            "ก่อนเลือกบริการอื่น")
+        return
     if check_existing_user(user_id):
         reply(reply_token, "ยินดีให้บริการค่ะ/ครับ")
         send_flex_choice(user_id)
@@ -765,26 +1007,19 @@ def handle_register(line_bot_api, reply_token, user_id, user_message):
         reply_message(line_bot_api, reply_token, "⚠️ กรุณาระบุข้อมูลให้ครบถ้วน")
 
 def check_latest_ticket(reply_token, user_id):
-    """แสดงรายการ Ticket ทั้งหมดของผู้ใช้"""
+    """แสดงรายการ Ticket ทั้งหมดของผู้ใช้เฉพาะประเภท Service และ Helpdesk"""
     try:
         user_tickets = get_all_user_tickets(user_id)
-        
         if not user_tickets:
-            reply(reply_token, "⚠️ ไม่พบ Ticket ของคุณในระบบ")
+            reply(reply_token, "⚠️ ไม่พบ Ticket บริการหรือปัญหาในระบบ")
             return
-        
-        # สร้าง Flex Message สำหรับแสดงรายการ Ticket
         bubbles = []
         for ticket in user_tickets:
-            # กำหนดสีตามสถานะ
             status_color = "#1DB446" if ticket['status'] == "Completed" else "#FF0000" if ticket['status'] == "Rejected" else "#005BBB"
-            
-            # แสดงวันที่ในรูปแบบที่อ่านง่าย
             try:
                 ticket_date = datetime.strptime(ticket['date'], "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y %H:%M")
             except:
-                ticket_date = ticket['date']
-            
+                ticket_date = str(ticket['date'])
             bubble = {
                 "type": "bubble",
                 "size": "kilo",
@@ -797,7 +1032,8 @@ def check_latest_ticket(reply_token, user_id):
                             "text": f"📄 Ticket {ticket['ticket_id']}",
                             "weight": "bold",
                             "size": "md",
-                            "color": "#005BBB"
+                            "color": "#005BBB",
+                            "wrap": True
                         }
                     ]
                 },
@@ -844,154 +1080,99 @@ def check_latest_ticket(reply_token, user_id):
                 }
             }
             bubbles.append(bubble)
-        
-        # สร้างข้อความแนะนำการใช้งาน
         guide_message = {
             "type": "text",
-            "text": "📌 คุณสามารถดูประวัติ Ticket ย้อนหลังได้โดยกดปุ่ม 'ดูประวัติย้อนหลัง' และเลือกเดือนที่ต้องการ",
+            "text": "📌 คุณสามารถดูประวัติ Ticket บริการและปัญหาย้อนหลังได้โดยกดปุ่ม 'ดูประวัติย้อนหลัง' และเลือกเดือนที่ต้องการ",
             "wrap": True
         }
-        
-        # สร้าง Flex Message แบบ Carousel ถ้ามีหลาย Ticket
         if len(bubbles) > 1:
             flex_message = {
                 "type": "flex",
-                "altText": "รายการ Ticket ของคุณ",
+                "altText": "รายการ Ticket บริการและปัญหาของคุณ",
                 "contents": {
                     "type": "carousel",
-                    "contents": bubbles[:10]  # แสดงสูงสุด 10 Ticket
+                    "contents": bubbles[:10]
                 }
             }
         else:
             flex_message = {
                 "type": "flex",
-                "altText": "รายการ Ticket ของคุณ",
+                "altText": "รายการ Ticket บริการและปัญหาของคุณ",
                 "contents": bubbles[0]
             }
-        
-        # ส่งทั้งข้อความแนะนำและ Flex Message
         send_reply_message(reply_token, [guide_message, flex_message])
-        
     except Exception as e:
         print("❌ Error in check_latest_ticket:", str(e))
         traceback.print_exc()
         reply(reply_token, "⚠️ เกิดข้อผิดพลาดในการดึงข้อมูล Ticket")
 
 def show_ticket_details(reply_token, ticket_id, user_id=None):
-    """แสดงรายละเอียดของ Ticket ที่เลือก"""
+    """แสดงรายละเอียดของ Ticket ที่เลือก (เฉพาะประเภท Service และ Helpdesk)"""
     try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("Tickets").sheet1
-        data = sheet.get_all_records()
-        
-        # ค้นหา Ticket ที่ตรงกับ ticket_id
-        found_ticket = None
-        for row in data:
-            if row.get('Ticket ID') == ticket_id or row.get('หมายเลข Ticket') == ticket_id:
-                # ตรวจสอบว่าเป็น Ticket ของผู้ใช้ที่ขอรายละเอียด (ถ้ามี user_id)
-                if not user_id or str(row.get('User ID', '')).strip() == str(user_id).strip():
-                    # จัดรูปแบบเบอร์โทรศัพท์
-                    phone = str(row.get('เบอร์ติดต่อ', ''))
-                    phone = phone.replace("'", "")
-                    if phone and not phone.startswith('0'):
-                        phone = '0' + phone[-9:]
-                    
-                    found_ticket = {
-                        'ticket_id': row.get('Ticket ID', 'TICKET-UNKNOWN'),
-                        'email': row.get('อีเมล', 'ไม่มีข้อมูล'),
-                        'name': row.get('ชื่อ', 'ไม่มีข้อมูล'),
-                        'phone': phone,
-                        'department': row.get('แผนก', 'ไม่มีข้อมูล'),
-                        'date': row.get('วันที่แจ้ง', 'ไม่มีข้อมูล'),
-                        'status': row.get('สถานะ', 'Pending'),
-                        'appointment': row.get('Appointment', 'None'),
-                        'requeste': row.get('Requeste', 'None'),
-                        'report': row.get('Report', 'None'),
-                        'type': row.get('Type', 'ไม่ระบุ')
-                    }
-                    break
-        
-        if not found_ticket:
-            reply(reply_token, f"⚠️ ไม่พบ Ticket {ticket_id} ในระบบ")
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM tickets WHERE ticket_id = %s AND type IN ('Service', 'Helpdesk')",
+            (ticket_id,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            reply(reply_token, f"⚠️ ไม่พบ Ticket บริการหรือปัญหา {ticket_id} ในระบบ")
             return
-        
-        # สร้าง Flex Message สำหรับแสดงรายละเอียด Ticket
+        # --- ใช้ get_row_value ---
+        def get_row_value(row, key, default=None):
+            if row is None:
+                return default
+            if isinstance(row, dict):
+                return row.get(key, default)
+            elif isinstance(row, tuple) and hasattr(cur, 'description') and cur.description is not None:
+                columns = [desc[0] for desc in cur.description]
+                if key in columns:
+                    return row[columns.index(key)]
+                return default
+            return default
+        if user_id and str(get_row_value(row, 'user_id', '')).strip() != str(user_id).strip():
+            reply(reply_token, f"⚠️ ไม่พบ Ticket {ticket_id} ของคุณในระบบ")
+            return
+        phone = str(get_row_value(row, 'phone', ''))
+        phone = phone.replace("'", "")
+        if phone and not phone.startswith('0'):
+            phone = '0' + phone[-9:]
+        found_ticket = {
+            'ticket_id': get_row_value(row, 'ticket_id', 'TICKET-UNKNOWN'),
+            'email': get_row_value(row, 'email', 'ไม่มีข้อมูล'),
+            'name': get_row_value(row, 'name', 'ไม่มีข้อมูล'),
+            'phone': phone,
+            'department': get_row_value(row, 'department', 'ไม่มีข้อมูล'),
+            'date': safe_datetime_to_string(get_row_value(row, 'created_at', ''), 'ไม่มีข้อมูล'),
+            'status': get_row_value(row, 'status', 'New'),
+            'appointment': get_row_value(row, 'appointment', 'None'),
+            'requested': get_row_value(row, 'requested', 'None'),
+            'report': get_row_value(row, 'report', 'None'),
+            'type': get_row_value(row, 'type', 'ไม่ระบุ')
+        }
         flex_message = create_ticket_flex_message(found_ticket)
         if not flex_message:
             reply(reply_token, "⚠️ เกิดข้อผิดพลาดในการสร้าง Ticket Summary")
             return
-            
         send_reply_message(reply_token, [flex_message])
-        
     except Exception as e:
         print("❌ Error in show_ticket_details:", str(e))
         traceback.print_exc()
         reply(reply_token, "⚠️ เกิดข้อผิดพลาดในการดึงข้อมูล Ticket")
 
-def show_ticket_details(reply_token, ticket_id, user_id=None):
-    """แสดงรายละเอียดของ Ticket ที่เลือก"""
-    try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("Tickets").sheet1
-        data = sheet.get_all_records()
-        
-        # ค้นหา Ticket ที่ตรงกับ ticket_id
-        found_ticket = None
-        for row in data:
-            if row.get('Ticket ID') == ticket_id or row.get('หมายเลข Ticket') == ticket_id:
-                # ตรวจสอบว่าเป็น Ticket ของผู้ใช้ที่ขอรายละเอียด (ถ้ามี user_id)
-                if not user_id or str(row.get('User ID', '')).strip() == str(user_id).strip():
-                    # จัดรูปแบบเบอร์โทรศัพท์
-                    phone = str(row.get('เบอร์ติดต่อ', ''))
-                    phone = phone.replace("'", "")
-                    if phone and not phone.startswith('0'):
-                        phone = '0' + phone[-9:]
-                    
-                    found_ticket = {
-                        'ticket_id': row.get('Ticket ID', 'TICKET-UNKNOWN'),
-                        'email': row.get('อีเมล', 'ไม่มีข้อมูล'),
-                        'name': row.get('ชื่อ', 'ไม่มีข้อมูล'),
-                        'phone': phone,
-                        'department': row.get('แผนก', 'ไม่มีข้อมูล'),
-                        'date': row.get('วันที่แจ้ง', 'ไม่มีข้อมูล'),
-                        'status': row.get('สถานะ', 'Pending'),
-                        'appointment': row.get('Appointment', 'None'),
-                        'requeste': row.get('Requeste', 'None'),
-                        'report': row.get('Report', 'None'),
-                        'type': row.get('Type', 'ไม่ระบุ')
-                    }
-                    break
-        
-        if not found_ticket:
-            reply(reply_token, f"⚠️ ไม่พบ Ticket {ticket_id} ในระบบ")
-            return
-        
-        # สร้าง Flex Message สำหรับแสดงรายละเอียด Ticket
-        flex_message = create_ticket_flex_message(found_ticket)
-        if not flex_message:
-            reply(reply_token, "⚠️ เกิดข้อผิดพลาดในการสร้าง Ticket Summary")
-            return
-            
-        send_reply_message(reply_token, [flex_message])
-        
-    except Exception as e:
-        print("❌ Error in show_ticket_details:", str(e))
-        traceback.print_exc()
-        reply(reply_token, "⚠️ เกิดข้อผิดพลาดในการดึงข้อมูล Ticket")
-
-def save_helpdesk_to_sheet(ticket_id, user_id, email, name, phone, department, report_time, appointment_time, issue_text):
+def save_helpdesk_to_sheet(ticket_id, user_id, email, name, phone, department, report_time, appointment_time, issue_text, subgroup=None):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         formatted_phone = format_phone_number(phone)
         cur.execute('''
             INSERT INTO tickets (
-                ticket_id, user_id, email, name, phone, department, created_at, status, appointment, requeste, report, type
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ticket_id, user_id, email, name, phone, department, created_at, 
+                status, appointment, requested, report, type, subgroup
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', (
             ticket_id,
             user_id,
@@ -1000,25 +1181,33 @@ def save_helpdesk_to_sheet(ticket_id, user_id, email, name, phone, department, r
             formatted_phone,
             department,
             report_time,
-            "Pending",
+            "New",
             appointment_time,
             "None",
             issue_text if issue_text else "None",
-            "Helpdesk"
+            "Helpdesk",
+            subgroup if subgroup else "None"
         ))
         conn.commit()
         cur.close()
         conn.close()
-        print(f"✅ Saved Helpdesk ticket: {ticket_id} (PostgreSQL)")
+        print(f"✅ Saved Helpdesk ticket with subgroup: {ticket_id} (PostgreSQL)")
         return True
     except Exception as e:
-        print("❌ Error saving Helpdesk ticket (PostgreSQL):", e)
+        print("❌ Error saving Helpdesk ticket with subgroup (PostgreSQL):", e)
         traceback.print_exc()
         return False
 
 def create_ticket_flex_message(ticket_data):
     try:
         status_color = "#1DB446" if ticket_data['status'] == "Completed" else "#FF0000" if ticket_data['status'] == "Rejected" else "#005BBB"
+        
+        # แปลง datetime เป็น string ถ้าจำเป็น
+        date_str = ticket_data['date']
+        if hasattr(date_str, 'strftime'):  # ถ้าเป็น datetime object
+            date_str = date_str.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            date_str = str(date_str)
         
         # สร้างเนื้อหาหลักของ Flex Message
         contents = [
@@ -1034,10 +1223,8 @@ def create_ticket_flex_message(ticket_data):
             }
         ]
         
-        # เพิ่มข้อมูลตามประเภท Ticket
         if ticket_data['type'] == "Service":
-            # สำหรับ Service Type - แสดง Requeste
-            if ticket_data['requeste'] != "None":
+            if ticket_data['requested'] != "None":
                 contents.append({
                     "type": "box",
                     "layout": "horizontal",
@@ -1051,7 +1238,7 @@ def create_ticket_flex_message(ticket_data):
                         },
                         {
                             "type": "text",
-                            "text": ticket_data['requeste'],
+                            "text": ticket_data['requested'],
                             "size": "sm",
                             "wrap": True,
                             "flex": 4
@@ -1059,7 +1246,6 @@ def create_ticket_flex_message(ticket_data):
                     ]
                 })
             
-            # แสดงเวลานัดหมายถ้ามี
             if ticket_data['appointment'] != "None":
                 try:
                     date_part, time_range = ticket_data['appointment'].split()
@@ -1071,7 +1257,6 @@ def create_ticket_flex_message(ticket_data):
                     contents.append(info_row("วันและเวลานัดหมาย", ticket_data['appointment']))
         
         elif ticket_data['type'] == "Helpdesk":
-            # สำหรับ Helpdesk Type - แสดง Report
             if ticket_data['report'] != "None":
                 contents.append({
                     "type": "box",
@@ -1113,7 +1298,8 @@ def create_ticket_flex_message(ticket_data):
                             "weight": "bold",
                             "size": "lg",
                             "color": "#005BBB",
-                            "align": "center"
+                            "align": "center",
+                            "wrap": True
                         }
                     ]
                 },
@@ -1159,7 +1345,14 @@ def send_reply_message(reply_token, messages):
         traceback.print_exc()
 
 def reply(reply_token, text):
-    send_reply_message(reply_token, [{"type": "text", "text": text}])
+    """ส่งข้อความพร้อม Quick Reply เมนูหลัก (ยกเว้นในกรณีที่อยู่ในขั้นตอนการทำงานอื่น)"""
+    # ไม่สามารถใช้ reply_token เป็น user_id ได้ ต้องแยกกรณี
+    message = {
+        "type": "text",
+        "text": text,
+        "quickReply": get_main_menu_quick_reply()
+    }
+    send_reply_message(reply_token, [message])
 
 def send_department_flex_message(reply_token):
     """ส่ง Flex Message สำหรับเลือกแผนกแบบสวยงามและใช้งานได้จริง"""
@@ -1687,7 +1880,8 @@ def send_department_flex_message(reply_token):
                         "size": "xxs",
                         "color": "#7F8C8D",
                         "align": "center",
-                        "margin": "sm"
+                        "margin": "sm",
+                        "wrap": True
                     }
                 ]
             },
@@ -1728,24 +1922,46 @@ def save_ticket_to_sheet(user_id, data, ticket_id):
         cur = conn.cursor()
         phone_number = format_phone_number(data['phone'])
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute('''
-            INSERT INTO tickets (
-                ticket_id, user_id, email, name, phone, department, created_at, status, appointment, requeste, report, type
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (
-            ticket_id,
-            user_id,
-            data['issue'],
-            data['category'],
-            phone_number,
-            data.get('department', '-'),
-            now,
-            "None",
-            now,  # Appointment
-            "None",  # Requeste
-            "None",  # Report
-            "Information"
-        ))
+        # ตรวจสอบว่ามี subgroup หรือไม่
+        if 'subgroup' in data:
+            cur.execute('''
+                INSERT INTO tickets (
+                    ticket_id, user_id, email, name, phone, department, created_at, status, appointment, requested, report, type, subgroup
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ''', (
+                ticket_id,
+                user_id,
+                data['issue'],
+                data['category'],
+                phone_number,
+                data.get('department', '-'),
+                now,
+                "None",
+                now,  # Appointment
+                "None",  # Requested
+                "None",  # Report
+                "Information",
+                data['subgroup']
+            ))
+        else:
+            cur.execute('''
+                INSERT INTO tickets (
+                    ticket_id, user_id, email, name, phone, department, created_at, status, appointment, requested, report, type
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ''', (
+                ticket_id,
+                user_id,
+                data['issue'],
+                data['category'],
+                phone_number,
+                data.get('department', '-'),
+                now,
+                "None",
+                now,  # Appointment
+                "None",  # Requested
+                "None",  # Report
+                "Information"
+            ))
         conn.commit()
         cur.close()
         conn.close()
@@ -1786,7 +2002,7 @@ def send_flex_choice(user_id):
                         "color": "#1DB446",
                         "action": {
                             "type": "message",
-                            "label": "Service",
+                            "label": "แจ้งบริการ",
                             "text": "นัดหมายเวลา"
                         }
                     },
@@ -1796,7 +2012,7 @@ def send_flex_choice(user_id):
                         "color": "#FF0000",
                         "action": {
                             "type": "message",
-                            "label": "Helpdesk",
+                            "label": "แจ้งปัญหา",
                             "text": "Helpdesk"
                         }
                     }
@@ -1832,7 +2048,8 @@ def send_flex_ticket_summary(user_id, data, ticket_id,type_vaul="Information"):
                         "text": "📄 สมัครสมาชิกสำเร็จ",
                         "weight": "bold",
                         "size": "lg",
-                        "color": "#1DB446"
+                        "color": "#1DB446",
+                        "wrap": True
                     }
                 ]
             },
@@ -1867,6 +2084,14 @@ def send_flex_ticket_summary(user_id, data, ticket_id,type_vaul="Information"):
 
 def handle_appointment(reply_token, user_id):
     """เริ่มกระบวนการนัดหมาย"""
+    # ตรวจสอบว่ามีเมนูอื่นทำงานอยู่หรือไม่
+    if user_id in user_states and user_states[user_id].get("step") not in [None, ""]:
+        current_service = user_states[user_id].get("service_type", "บริการปัจจุบัน")
+        reply(reply_token, 
+            f"⚠️ คุณกำลังใช้งาน '{current_service}' อยู่\n\n"
+            "กรุณาดำเนินการให้เสร็จสิ้นก่อน หรือพิมพ์ 'ยกเลิก' เพื่อออกจากการบริการนี้\n"
+            "ก่อนเลือกบริการอื่น")
+        return
     latest_ticket = get_latest_ticket(user_id)
     if not latest_ticket:
         reply(reply_token, "⚠️ ไม่พบ Ticket ของคุณในระบบ กรุณาสร้าง Ticket ก่อน")
@@ -1905,7 +2130,7 @@ def send_date_picker(reply_token):
                     },
                     {
                         "type": "text",
-                        "text": "สามารถเลือกวันใดก็ได้",
+                        "text": "กรุณาเลือกวันเดือนและปี",
                         "margin": "sm",
                         "size": "sm",
                         "color": "#AAAAAA"
@@ -1936,9 +2161,15 @@ def send_date_picker(reply_token):
     
     send_reply_message(reply_token, [flex_message])
 
-def send_time_picker(reply_token, selected_date):
+def send_time_picker(reply_token, selected_date, user_id=None):
+    # ดึงข้อมูลเวลาปัจจุบันถ้าวันที่เลือกเป็นวันนี้
+    current_time = None
+    now = datetime.now()
+    now_str = now.strftime('%d/%m/%Y %H:%M')
+    if user_id and user_id in user_states and "current_time" in user_states[user_id]:
+        current_time = datetime.strptime(user_states[user_id]["current_time"], "%H:%M").time()
     # กำหนดช่วงเวลาที่สามารถนัดหมายได้
-    time_slots = [
+    all_time_slots = [
         {"label": "05:00 - 06:00", "value": "05:00-06:00"},
         {"label": "06:00 - 07:00", "value": "06:00-07:00"},
         {"label": "07:00 - 08:00", "value": "07:00-08:00"},
@@ -1950,7 +2181,17 @@ def send_time_picker(reply_token, selected_date):
         {"label": "14:00 - 15:00", "value": "14:00-15:00"},
         {"label": "15:00 - 16:00", "value": "15:00-16:00"}
     ]
-    
+    # กรองเวลาเฉพาะวันนี้
+    time_slots = []
+    if current_time:
+        for slot in all_time_slots:
+            start_time_str = slot["value"].split('-')[0]
+            start_time = datetime.strptime(start_time_str, "%H:%M").time()
+            if start_time > current_time:
+                time_slots.append(slot)
+    else:
+        time_slots = all_time_slots
+
     # สร้าง Quick Reply buttons
     quick_reply_items = []
     for slot in time_slots:
@@ -1962,7 +2203,6 @@ def send_time_picker(reply_token, selected_date):
                 "text": slot["value"]
             }
         })
-    
     # เพิ่มตัวเลือกกรอกเวลาเอง
     quick_reply_items.append({
         "type": "action",
@@ -1972,15 +2212,13 @@ def send_time_picker(reply_token, selected_date):
             "text": "กรอกเวลาเอง"
         }
     })
-    
     message = {
         "type": "text",
-        "text": f"📅 วันที่คุณเลือก: {selected_date}\n\n⏰ กรุณาเลือกช่วงเวลาที่ต้องการ หรือกด 'กรอกเวลาเอง' เพื่อระบุเวลาแบบกำหนดเอง:",
+        "text": f"📅 วันที่คุณเลือก: {selected_date}\n⏰ เวลาปัจจุบัน: {now_str}\n\nกรุณาเลือกช่วงเวลาที่ต้องการนัดหมาย หรือพิมพ์ 'กรอกเวลาเอง' 10:00-11:00: HH:MM-HH:MM",
         "quickReply": {
             "items": quick_reply_items
         }
     }
-    
     send_reply_message(reply_token, [message])
 
 def send_appointment_quick_reply(reply_token):
@@ -2026,39 +2264,46 @@ def handle_save_appointment(reply_token, user_id, appointment_datetime):
     if user_id not in user_states or user_states[user_id].get("step") != "ask_appointment":
         reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
         return
-    
-    # เปลี่ยนสถานะเป็นรอรับความประสงค์
     user_states[user_id]["step"] = "ask_request"
     user_states[user_id]["appointment_datetime"] = appointment_datetime
-    
-    reply(reply_token, "📝 กรุณากรอกความประสงค์หรือรายละเอียดเพิ่มเติมของบริการที่ต้องการ")
+    quick_reply_items = [
+        {"type": "action", "action": {"type": "message", "label": "Hardware", "text": "Hardware"}},
+        {"type": "action", "action": {"type": "message", "label": "Meeting", "text": "Meeting"}},
+        {"type": "action", "action": {"type": "message", "label": "Service", "text": "Service"}},
+        {"type": "action", "action": {"type": "message", "label": "Software", "text": "Software"}},
+        {"type": "action", "action": {"type": "message", "label": "บริการอื่นๆ", "text": "บริการอื่นๆ"}},
+        {"type": "action", "action": {"type": "message", "label": "กรอกข้อมูลเอง", "text": "กรอกข้อมูลเอง"}}
+    ]
+    message = {
+        "type": "text",
+        "text": "กรุณาเลือกประเภทบริการที่ต้องการ:",
+        "quickReply": {"items": quick_reply_items}
+    }
+    send_reply_message(reply_token, [message])
 
 def handle_user_request(reply_token, user_id, request_text):
     """จัดการกับความประสงค์ที่ผู้ใช้กรอก"""
     if user_id not in user_states or user_states[user_id].get("step") != "ask_request":
         reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
         return
-    
-    # บันทึกข้อมูลชั่วคราวก่อน confirm
+    if request_text == "กรอกข้อมูลเอง":
+        reply(reply_token, "📝 กรุณากรอกรายละเอียดของบริการที่ต้องการ เช่น ตั้งค่าคอมพิวเตอร์, ขอ Link ประชุม Zoom เป็นต้น")
+        user_states[user_id]["step"] = "ask_custom_request"
+        return
     user_states[user_id]["request_text"] = request_text
-    user_states[user_id]["step"] = "pre_service"
-    
-    # ส่ง Confirm Message
-    confirm_msg = create_confirm_message(
-        "service",
-        f"นัดหมาย: {user_states[user_id]['appointment_datetime']}\nความประสงค์: {request_text}"
-    )
-    send_reply_message(reply_token, [confirm_msg])
+    user_states[user_id]["step"] = "ask_subgroup"
+    send_service_subgroup_quick_reply(reply_token, request_text)
 
-def save_appointment_with_request(ticket_id, user_id, email, name, phone, department, appointment_datetime, request_text):
+def save_appointment_with_request(ticket_id, user_id, email, name, phone, department, appointment_datetime, request_text, subgroup=None):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         formatted_phone = format_phone_number(phone)
         cur.execute('''
             INSERT INTO tickets (
-                ticket_id, user_id, email, name, phone, department, created_at, status, appointment, requeste, report, type
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ticket_id, user_id, email, name, phone, department, created_at, 
+                status, appointment, requested, report, type, subgroup
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', (
             ticket_id,
             user_id,
@@ -2067,29 +2312,42 @@ def save_appointment_with_request(ticket_id, user_id, email, name, phone, depart
             formatted_phone,
             department,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Pending",
+            "New",
             appointment_datetime,
             request_text if request_text else "None",
             "None",
-            "Service"
+            "Service",
+            subgroup if subgroup else "None"
         ))
         conn.commit()
         cur.close()
         conn.close()
-        print(f"✅ Saved Service ticket: {ticket_id} (PostgreSQL)")
+        print(f"✅ Saved Service ticket with subgroup: {ticket_id} (PostgreSQL)")
         return True
     except Exception as e:
-        print("❌ Error saving Service ticket (PostgreSQL):", e)
+        print("❌ Error saving Service ticket with subgroup (PostgreSQL):", e)
         traceback.print_exc()
         return False
 
 def send_ticket_summary_with_request(user_id, ticket_id, appointment_datetime, request_text, email, name, phone, department, type_value="Service"):
     try:
+        # แปลง datetime เป็น string ถ้าจำเป็น
+        appointment_str = appointment_datetime
+        if hasattr(appointment_str, 'strftime'):  # ถ้าเป็น datetime object
+            appointment_str = appointment_str.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            appointment_str = str(appointment_str)
+        
         # แยกข้อมูลวันที่และเวลา
-        date_part, time_range = appointment_datetime.split()
-        dt = datetime.strptime(date_part, "%Y-%m-%d")
-        formatted_date = dt.strftime("%d/%m/%Y")
-        start_time, end_time = time_range.split('-')
+        try:
+            date_part, time_range = appointment_str.split()
+            dt = datetime.strptime(date_part, "%Y-%m-%d")
+            formatted_date = dt.strftime("%d/%m/%Y")
+            start_time, end_time = time_range.split('-')
+        except:
+            formatted_date = appointment_str
+            start_time = "N/A"
+            end_time = "N/A"
         
         flex_message = {
             "type": "flex",
@@ -2103,10 +2361,11 @@ def send_ticket_summary_with_request(user_id, ticket_id, appointment_datetime, r
                     "contents": [
                         {
                             "type": "text",
-                            "text": f"📄 Ticket {ticket_id}",
+                            "text": f"📄 Ticket  {ticket_id}",
                             "weight": "bold",
                             "size": "lg",
-                            "color": "#005BBB"
+                            "color": "#005BBB",
+                            "wrap": True
                         }
                     ]
                 },
@@ -2146,7 +2405,7 @@ def send_ticket_summary_with_request(user_id, ticket_id, appointment_datetime, r
                                 }
                             ]
                         },
-                        status_row("สถานะ", "Pending", "#005BBB")
+                        status_row("สถานะ", "New", "#005BBB")
                     ]
                 }
             }
@@ -2202,16 +2461,33 @@ def get_latest_ticket(user_id):
         conn.close()
         if not row:
             return None
-        phone = str(row['phone']) if row['phone'] else ''
+        def get_row_value(row, key, default=None):
+            if row is None:
+                return default
+            if isinstance(row, dict):
+                return row.get(key, default)
+            elif isinstance(row, tuple) and hasattr(cur, 'description') and cur.description is not None:
+                columns = [desc[0] for desc in cur.description]
+                if key in columns:
+                    return row[columns.index(key)]
+                return default
+            return default
+        phone = str(get_row_value(row, 'phone')) if get_row_value(row, 'phone') else ''
         phone = phone.replace("'", "")
         if phone and not phone.startswith('0'):
             phone = '0' + phone[-9:]
+        # แปลง datetime เป็น string
+        created_at = get_row_value(row, 'created_at', '')
+        if hasattr(created_at, 'strftime'):  # ถ้าเป็น datetime object
+            created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            created_at = str(created_at)
         latest_ticket = {
-            'อีเมล': row.get('email', ''),
-            'ชื่อ': row.get('name', ''),
+            'อีเมล': get_row_value(row, 'email', ''),
+            'ชื่อ': get_row_value(row, 'name', ''),
             'เบอร์ติดต่อ': phone,
-            'แผนก': row.get('department', ''),
-            'วันที่แจ้ง': row.get('created_at', ''),
+            'แผนก': get_row_value(row, 'department', ''),
+            'วันที่แจ้ง': created_at,
         }
         return latest_ticket
     except Exception as e:
@@ -2248,8 +2524,20 @@ def check_existing_user(user_id):
         row = cur.fetchone()
         cur.close()
         conn.close()
-        if row and (row.get('email') or row.get('issue')):
-            return True
+        if row:
+            def get_row_value(row, key, default=None):
+                if row is None:
+                    return default
+                if isinstance(row, dict):
+                    return row.get(key, default)
+                elif isinstance(row, tuple) and hasattr(cur, 'description') and cur.description is not None:
+                    columns = [desc[0] for desc in cur.description]
+                    if key in columns:
+                        return row[columns.index(key)]
+                    return default
+                return default
+            if get_row_value(row, 'email') or get_row_value(row, 'issue'):
+                return True
         return False
     except Exception as e:
         print("❌ Error checking user ID (PostgreSQL):", e)
@@ -2258,22 +2546,38 @@ def check_existing_user(user_id):
 
 def check_ticket_status(ticket_id):
     try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("Tickets").sheet1
-        data = sheet.get_all_records()
-
-        for row in data:
-            if row.get('หมายเลข Ticket') == ticket_id or row.get('Ticket ID') == ticket_id:
-                return (
-                    f"\nอีเมล: {row.get('อีเมล') or row.get('issue') or '-'}\n"
-                    f"ชื่อ: {row.get('ชื่อ') or row.get('category') or '-'}\n"
-                    f"เบอร์ติดต่อ: {display_phone_number(row.get('เบอร์ติดต่อ') or row.get('phone'))}\n"
-                    f"แผนก: {row.get('แผนก') or row.get('department') or '-'}\n"
-                    f"สถานะ: {row.get('สถานะ') or row.get('status') or '-'}"
-                )
-
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM tickets WHERE ticket_id = %s", (ticket_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if row:
+            def get_row_value(row, key, default=None):
+                if row is None:
+                    return default
+                if isinstance(row, dict):
+                    return row.get(key, default)
+                elif isinstance(row, tuple) and hasattr(cur, 'description') and cur.description is not None:
+                    columns = [desc[0] for desc in cur.description]
+                    if key in columns:
+                        return row[columns.index(key)]
+                    return default
+                return default
+            phone = str(get_row_value(row, 'phone', ''))
+            phone = phone.replace("'", "")
+            if phone and not phone.startswith('0'):
+                phone = '0' + phone[-9:]
+            
+            return (
+                f"\nอีเมล: {safe_dict_value(get_row_value(row, 'email'))}\n"
+                f"ชื่อ: {safe_dict_value(get_row_value(row, 'name'))}\n"
+                f"เบอร์ติดต่อ: {display_phone_number(phone)}\n"
+                f"แผนก: {safe_dict_value(get_row_value(row, 'department'))}\n"
+                f"สถานะ: {safe_dict_value(get_row_value(row, 'status'))}"
+            )
+        
         return None
     except Exception as e:
         print("❌ Error checking status:", e)
@@ -2282,6 +2586,14 @@ def check_ticket_status(ticket_id):
 
 def handle_helpdesk(reply_token, user_id):
     """เริ่มกระบวนการแจ้งปัญหา Helpdesk"""
+    # ตรวจสอบว่ามีเมนูอื่นทำงานอยู่หรือไม่
+    if user_id in user_states and user_states[user_id].get("step") not in [None, ""]:
+        current_service = user_states[user_id].get("service_type", "บริการปัจจุบัน")
+        reply(reply_token, 
+            f"⚠️ คุณกำลังใช้งาน '{current_service}' อยู่\n\n"
+            "กรุณาดำเนินการให้เสร็จสิ้นก่อน หรือพิมพ์ 'ยกเลิก' เพื่อออกจากการบริการนี้\n"
+            "ก่อนเลือกบริการอื่น")
+        return
     latest_ticket = get_latest_ticket(user_id)
     if not latest_ticket:
         reply(reply_token, "⚠️ ไม่พบข้อมูลผู้ใช้ในระบบ กรุณาสมัครสมาชิกก่อน")
@@ -2318,54 +2630,19 @@ def handle_helpdesk(reply_token, user_id):
 def send_helpdesk_quick_reply(reply_token):
     """ส่ง Quick Reply สำหรับปัญหาทั่วไป"""
     quick_reply_items = [
-        {
-            "type": "action",
-            "action": {
-                "type": "message",
-                "label": "คอมพิวเตอร์เสีย",
-                "text": "คอมพิวเตอร์เสีย"
-            }
-        },
-        {
-            "type": "action",
-            "action": {
-                "type": "message",
-                "label": "เน็ตเวิร์คล่ม",
-                "text": "เน็ตเวิร์คล่ม"
-            }
-        },
-        {
-            "type": "action",
-            "action": {
-                "type": "message",
-                "label": "เครื่องปริ้นเตอร์ไม่ทำงาน",
-                "text": "เครื่องปริ้นเตอร์ไม่ทำงาน"
-            }
-        },
-        {
-            "type": "action",
-            "action": {
-                "type": "message",
-                "label": "อุปกรณ์เสียหาย",
-                "text": "อุปกรณ์เสียหาย"
-            }
-        },
-        {
-            "type": "action",
-            "action": {
-                "type": "message",
-                "label": "อื่นๆ ไม่สามารถระบุได้",
-                "text": "แจ้งปัญหาอื่นๆ"
-            }
-        },
+        {"type": "action", "action": {"type": "message", "label": "คอมพิวเตอร์", "text": "คอมพิวเตอร์ / Hardware"}},
+        {"type": "action", "action": {"type": "message", "label": "โปรแกรม", "text": "โปรแกรม / Software"}},
+        {"type": "action", "action": {"type": "message", "label": "ปริ้นเตอร์", "text": "ปริ้นเตอร์ / Printer"}},
+        {"type": "action", "action": {"type": "message", "label": "อุปกรณ์อื่นๆ", "text": "อุปกรณ์อื่นๆ / Devices"}},
+        {"type": "action", "action": {"type": "message", "label": "การใช้งานทั่วไป", "text": "การใช้งานทั่วไป"}},
+        {"type": "action", "action": {"type": "message", "label": "ข้อมูล", "text": "ข้อมูล / Data"}},
+        {"type": "action", "action": {"type": "message", "label": "เน็ตเวิร์ค", "text": "เน็ตเวิร์ค / Network"}},
+        {"type": "action", "action": {"type": "message", "label": "ปัญหาอื่นๆ", "text": "ปัญหาอื่นๆ"}},
     ]
-    
     message = {
         "type": "text",
-        "text": "กรุณาแจ้งปัญหา:",
-        "quickReply": {
-            "items": quick_reply_items
-        }
+        "text": "กรุณาเลือกประเภทปัญหาที่ต้องการแจ้ง:",
+        "quickReply": {"items": quick_reply_items}
     }
     send_reply_message(reply_token, [message])
 
@@ -2374,20 +2651,113 @@ def handle_helpdesk_issue(reply_token, user_id, issue_text):
     if user_id not in user_states or user_states[user_id].get("step") != "ask_helpdesk_issue":
         reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
         return
-    
-    # บันทึกข้อมูลชั่วคราวก่อน confirm
     user_states[user_id]["issue_text"] = issue_text
+    if issue_text == "ปัญหาอื่นๆ":
+        user_states[user_id]["step"] = "ask_custom_issue"
+        reply(reply_token, "📝 กรุณาระบุปัญหาที่ต้องการแจ้ง")
+        return
+    user_states[user_id]["step"] = "ask_helpdesk_subgroup"
+    send_helpdesk_subgroup_quick_reply(reply_token, issue_text)
+
+def send_helpdesk_subgroup_quick_reply(reply_token, issue_text):
+    """ส่ง Quick Reply สำหรับรายละเอียดย่อยของปัญหา Helpdesk"""
+    subgroup_options = {
+        "คอมพิวเตอร์ / Hardware": [
+            "เครื่องไม่เปิด", "เครื่องค้าง", "เครื่องช้า", 
+            "หน้าจอเสีย", "ฮาร์ดดิสก์มีปัญหา", "อื่นๆ"
+        ],
+        "โปรแกรม / Software": [
+            "ติดตั้งโปรแกรม", "อัปเดตโปรแกรม", "โปรแกรมค้าง",
+            "โปรแกรมทำงานผิดปกติ", "ลบโปรแกรม", "อื่นๆ"
+        ],
+        "ปริ้นเตอร์ / Printer": [
+            "พิมพ์ไม่ออก", "กระดาษติด", "สีเพี้ยน",
+            "เชื่อมต่อไม่ได้", "กระดาษหมด", "อื่นๆ"
+        ],
+        "อุปกรณ์อื่นๆ / Devices": [
+            "เมาส์", "คีย์บอร์ด", "ลำโพง",
+            "ไมโครโฟน", "เว็บแคม", "อื่นๆ"
+        ],
+        "เน็ตเวิร์ค / Network": [
+            "เชื่อมต่อ Wi-Fi ไม่ได้", "อินเทอร์เน็ตช้า",
+            "เชื่อมต่อเครือข่ายไม่ได้", "VPN มีปัญหา", "อื่นๆ"
+        ],
+        "การใช้งานทั่วไป": [
+            "ลืมรหัสผ่าน", "ล็อกอินไม่ได้",
+            "อีเมลมีปัญหา", "อื่นๆ"
+        ],
+        "ข้อมูล / Data": [
+            "ข้อมูลหาย", "กู้ข้อมูล", "แบ็กอัปข้อมูล",
+            "โอนย้ายข้อมูล", "อื่นๆ"
+        ]
+    }
+    options = subgroup_options.get(issue_text, ["อื่นๆ"])
+    quick_reply_items = [
+        {
+            "type": "action",
+            "action": {
+                "type": "message",
+                "label": opt,
+                "text": opt
+            }
+        } for opt in options
+    ]
+    quick_reply_items.append({
+        "type": "action",
+        "action": {
+            "type": "message",
+            "label": "กรอกรายละเอียดเอง",
+            "text": "กรอกรายละเอียดเอง"
+        }
+    })
+    message = {
+        "type": "text",
+        "text": f"กรุณาเลือกรายละเอียดย่อยสำหรับ {issue_text} หรือกรอกเอง:",
+        "quickReply": {
+            "items": quick_reply_items
+        }
+    }
+    send_reply_message(reply_token, [message])
+
+def handle_helpdesk_subgroup(reply_token, user_id, subgroup_text):
+    """จัดการกับรายละเอียดย่อยของปัญหา Helpdesk"""
+    if user_id not in user_states or user_states[user_id].get("step") != "ask_helpdesk_subgroup":
+        reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
+        return
+    if subgroup_text == "กรอกรายละเอียดเอง":
+        user_states[user_id]["step"] = "ask_custom_helpdesk_subgroup"
+        reply(reply_token, "📝 กรุณากรอกรายละเอียดย่อยด้วยตัวเอง")
+        return
+    user_states[user_id]["subgroup"] = subgroup_text
     user_states[user_id]["step"] = "pre_helpdesk"
-    
-    # ส่ง Confirm Message
     confirm_msg = create_confirm_message(
         "helpdesk",
-        f"แจ้งปัญหา: {issue_text}"
+        f"แจ้งปัญหา: {user_states[user_id]['issue_text']}\n"
+        f"รายละเอียดย่อย: {subgroup_text}"
     )
     send_reply_message(reply_token, [confirm_msg])
 
-def send_helpdesk_summary(user_id, ticket_id, report_time, issue_text, email, name, phone, department, type_value="Helpdesk"):
+def handle_custom_helpdesk_subgroup(reply_token, user_id, custom_text):
+    """จัดการกับรายละเอียดย่อยที่ผู้ใช้กรอกเอง"""
+    if user_id not in user_states or user_states[user_id].get("step") != "ask_custom_helpdesk_subgroup":
+        reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
+        return
+    user_states[user_id]["subgroup"] = custom_text
+    user_states[user_id]["step"] = "pre_helpdesk"
+    confirm_msg = create_confirm_message(
+        "helpdesk",
+        f"แจ้งปัญหา: {user_states[user_id]['issue_text']}\n"
+        f"รายละเอียดย่อย: {custom_text}"
+    )
+    send_reply_message(reply_token, [confirm_msg])
+
+def send_helpdesk_summary(user_id, ticket_id, report_time, issue_text, email, name, phone, department, subgroup=None):
     try:
+        report_time_str = report_time
+        if hasattr(report_time_str, 'strftime'):
+            report_time_str = report_time_str.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            report_time_str = str(report_time_str)
         flex_message = {
             "type": "flex",
             "altText": f"สรุป Ticket {ticket_id}",
@@ -2416,67 +2786,20 @@ def send_helpdesk_summary(user_id, ticket_id, report_time, issue_text, email, na
                         info_row("ชื่อ", name),
                         info_row("เบอร์ติดต่อ", display_phone_number(phone)),
                         info_row("แผนก", department),
-                        info_row("วันที่แจ้ง", report_time),
-                        {
-                            "type": "separator",
-                            "margin": "md"
-                        },
-                        info_row("ประเภท", type_value),
-                        {
-                            "type": "box",
-                            "layout": "horizontal",
-                            "contents": [
-                                {
-                                    "type": "text",
-                                    "text": "วันที่แจ้งปัญหา:",
-                                    "size": "sm",
-                                    "color": "#AAAAAA",
-                                    "flex": 2
-                                },
-                                {
-                                    "type": "text",
-                                    "text": report_time,
-                                    "size": "sm",
-                                    "wrap": True,
-                                    "flex": 4
-                                }
-                            ]
-                        },
-                        {
-                            "type": "separator",
-                            "margin": "md"
-                        },
-                        {
-                            "type": "box",
-                            "layout": "horizontal",
-                            "contents": [
-                                {
-                                    "type": "text",
-                                    "text": "ปัญหาที่แจ้ง:",
-                                    "size": "sm",
-                                    "color": "#AAAAAA",
-                                    "flex": 2
-                                },
-                                {
-                                    "type": "text",
-                                    "text": issue_text,
-                                    "size": "sm",
-                                    "wrap": True,
-                                    "flex": 4
-                                }
-                            ]
-                        },
-                        status_row("สถานะ", "Pending", "#005BBB")
+                        info_row("วันที่แจ้ง", report_time_str),
+                        {"type": "separator", "margin": "md"},
+                        info_row("ประเภท", "Helpdesk"),
+                        info_row("ปัญหาหลัก", issue_text),
+                        info_row("รายละเอียดย่อย", subgroup if subgroup else "ไม่มี"),
+                        status_row("สถานะ", "New", "#005BBB")
                     ]
                 }
             }
         }
-
         body = {
             "to": user_id,
             "messages": [flex_message]
         }
-
         res = requests.post('https://api.line.me/v2/bot/message/push', headers=LINE_HEADERS, json=body)
         print("📤 Sent Helpdesk Summary:", res.status_code, res.text)
     except Exception as e:
@@ -2484,31 +2807,50 @@ def send_helpdesk_summary(user_id, ticket_id, report_time, issue_text, email, na
         traceback.print_exc()
 
 def get_all_user_tickets(user_id):
-    """ดึง Ticket ทั้งหมดของผู้ใช้จาก PostgreSQL"""
+    """ดึง Ticket ทั้งหมดของผู้ใช้จาก PostgreSQL เฉพาะประเภท Service และ Helpdesk"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM tickets WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+        cur.execute(
+            "SELECT * FROM tickets WHERE user_id = %s AND type IN ('Service', 'Helpdesk') ORDER BY created_at DESC",
+            (user_id,)
+        )
         rows = cur.fetchall()
         user_tickets = []
+        columns = [desc[0] for desc in cur.description] if hasattr(cur, 'description') and cur.description is not None else []
         for row in rows:
-            # row เป็น dict เพราะใช้ RealDictCursor
-            phone = str(row['phone']) if row['phone'] else ''
+            def get_row_value(row, key, default=None):
+                if row is None:
+                    return default
+                if isinstance(row, dict):
+                    return row.get(key, default)
+                elif isinstance(row, tuple) and columns:
+                    if key in columns:
+                        return row[columns.index(key)]
+                    return default
+                return default
+            phone = str(get_row_value(row, 'phone')) if get_row_value(row, 'phone') else ''
             phone = phone.replace("'", "")
             if phone and not phone.startswith('0'):
                 phone = '0' + phone[-9:]
+            created_at = get_row_value(row, 'created_at', 'ไม่มีข้อมูล')
+            # ตรวจสอบชนิดข้อมูลก่อนเรียก strftime
+            if isinstance(created_at, datetime):
+                created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                created_at = str(created_at)
             ticket_data = {
-                'ticket_id': row.get('ticket_id', 'TICKET-UNKNOWN'),
-                'email': row.get('email', 'ไม่มีข้อมูล'),
-                'name': row.get('name', 'ไม่มีข้อมูล'),
+                'ticket_id': get_row_value(row, 'ticket_id', 'TICKET-UNKNOWN'),
+                'email': get_row_value(row, 'email', 'ไม่มีข้อมูล'),
+                'name': get_row_value(row, 'name', 'ไม่มีข้อมูล'),
                 'phone': phone,
-                'department': row.get('department', 'ไม่มีข้อมูล'),
-                'date': row.get('created_at', 'ไม่มีข้อมูล'),
-                'status': row.get('status', 'Pending'),
-                'appointment': row.get('appointment', 'None'),
-                'requeste': row.get('requeste', 'None'),
-                'report': row.get('report', 'None'),
-                'type': row.get('type', 'ไม่ระบุ')
+                'department': get_row_value(row, 'department', 'ไม่มีข้อมูล'),
+                'date': created_at,
+                'status': get_row_value(row, 'status', 'New'),
+                'appointment': get_row_value(row, 'appointment', 'None'),
+                'requested': get_row_value(row, 'requested', 'None'),
+                'report': get_row_value(row, 'report', 'None'),
+                'type': get_row_value(row, 'type', 'ไม่ระบุ')
             }
             user_tickets.append(ticket_data)
         cur.close()
@@ -2539,7 +2881,7 @@ def create_confirm_message(action_type, details):
                     },
                     {
                         "type": "text",
-                        "text": f"คุณต้องการ{action_type}ใช่หรือไม่?",
+                        "text": f"คุณต้องการเรียกใช้ {action_type} ยืนยันหรือไม่?",
                         "margin": "md",
                         "size": "md"
                     },
@@ -2549,11 +2891,18 @@ def create_confirm_message(action_type, details):
                     },
                     {
                         "type": "text",
-                        "text": details[:100] + "..." if len(details) > 100 else details,
+                        "text": details,  # แสดงข้อความทั้งหมด ไม่ตัด ...
                         "margin": "lg",
                         "wrap": True,
                         "size": "sm",
                         "color": "#666666"
+                    },
+                    {
+                        "type": "text",
+                        "text": "พิมพ์ 'ยกเลิก' เพื่อออกจากการดำเนินการนี้",
+                        "margin": "lg",
+                        "size": "xs",
+                        "color": "#AAAAAA"
                     }
                 ]
             },
@@ -2622,8 +2971,150 @@ def get_db_connection():
     )
     return conn
 
+# --- เพิ่มฟังก์ชัน Service Subgroup ---
+def send_service_subgroup_quick_reply(reply_token, request_text):
+    """ส่ง Quick Reply สำหรับรายละเอียดย่อยของบริการ"""
+    subgroup_options = {
+        "Hardware": ["ลงทะเบียน USB", "ตรวจสอบอุปกรณ์", "ติดตั้งอุปกรณ์", "อื่นๆ"],
+        "Meeting": ["ขอ Link ประชุม / Zoom", "เชื่อมต่อ TV", "ตั้งค่าห้องประชุม", "อื่นๆ"],
+        "Service": ["ขอยืมอุปกรณ์", "เชื่อมต่ออุปกรณ์", "ซ่อมบำรุง", "อื่นๆ"],
+        "Software": ["ติดตั้งโปรแกรม", "อัปเดตโปรแกรม", "ลบโปรแกรม", "อื่นๆ"],
+        "บริการอื่นๆ": ["ขอคำปรึกษา", "ฝึกอบรม", "อื่นๆ"]
+    }
+    options = subgroup_options.get(request_text, ["อื่นๆ"])
+    quick_reply_items = [
+        {"type": "action", "action": {"type": "message", "label": opt, "text": opt}} for opt in options
+    ]
+    quick_reply_items.append({
+        "type": "action",
+        "action": {"type": "message", "label": "กรอกรายละเอียดเอง", "text": "กรอกรายละเอียดเอง"}
+    })
+    message = {
+        "type": "text",
+        "text": f"กรุณาเลือกรายละเอียดย่อยสำหรับ {request_text} หรือกรอกเอง:",
+        "quickReply": {"items": quick_reply_items}
+    }
+    send_reply_message(reply_token, [message])
+
+def handle_service_subgroup(reply_token, user_id, subgroup_text):
+    if user_id not in user_states or user_states[user_id].get("step") != "ask_subgroup":
+        reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
+        return
+    if subgroup_text == "กรอกรายละเอียดเอง":
+        user_states[user_id]["step"] = "ask_custom_subgroup"
+        reply(reply_token, "📝 กรุณากรอกรายละเอียดย่อยด้วยตัวเอง")
+        return
+    user_states[user_id]["subgroup"] = subgroup_text
+    user_states[user_id]["step"] = "pre_service"
+    confirm_msg = create_confirm_message("service", f"นัดหมาย: {user_states[user_id]['appointment_datetime']}\nความประสงค์: {user_states[user_id]['request_text']}\nรายละเอียดย่อย: {subgroup_text}")
+    send_reply_message(reply_token, [confirm_msg])
+
+def handle_custom_subgroup(reply_token, user_id, custom_text):
+    if user_id not in user_states or user_states[user_id].get("step") != "ask_custom_subgroup":
+        reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
+        return
+    user_states[user_id]["subgroup"] = custom_text
+    user_states[user_id]["step"] = "pre_service"
+    confirm_msg = create_confirm_message("service", f"นัดหมาย: {user_states[user_id]['appointment_datetime']}\nความประสงค์: {user_states[user_id]['request_text']}\nรายละเอียดย่อย: {custom_text}")
+    send_reply_message(reply_token, [confirm_msg])
+
+def handle_custom_request(reply_token, user_id, custom_text):
+    """จัดการกับความประสงค์ที่ผู้ใช้กรอกเอง"""
+    if user_id not in user_states or user_states[user_id].get("step") != "ask_custom_request":
+        reply(reply_token, "⚠️ เกิดข้อผิดพลาด กรุณาเริ่มกระบวนการใหม่")
+        return
+    user_states[user_id]["request_text"] = custom_text
+    user_states[user_id]["step"] = "ask_subgroup"
+    quick_reply_items = [
+        {"type": "action", "action": {"type": "message", "label": "ลงทะเบียน USB", "text": "ลงทะเบียน USB"}},
+        {"type": "action", "action": {"type": "message", "label": "ตรวจสอบอุปกรณ์", "text": "ตรวจสอบอุปกรณ์"}},
+        {"type": "action", "action": {"type": "message", "label": "ขอ Link ประชุม / Zoom", "text": "ขอ Link ประชุม / Zoom"}},
+        {"type": "action", "action": {"type": "message", "label": "เชื่อมต่อ TV", "text": "เชื่อมต่อ TV"}},
+        {"type": "action", "action": {"type": "message", "label": "เชื่อมต่ออุปกรณ์", "text": "เชื่อมต่ออุปกรณ์"}},
+        {"type": "action", "action": {"type": "message", "label": "ติดตั้งโปรแกรม", "text": "ติดตั้งโปรแกรม"}},
+        {"type": "action", "action": {"type": "message", "label": "อื่นๆ", "text": "อื่นๆ"}},
+        {"type": "action", "action": {"type": "message", "label": "กรอกรายละเอียดเอง", "text": "กรอกรายละเอียดเอง"}}
+    ]
+    message = {
+        "type": "text",
+        "text": f"กรุณาเลือกรายละเอียดย่อยสำหรับ '{custom_text}' หรือกรอกเอง:",
+        "quickReply": {"items": quick_reply_items}
+    }
+    send_reply_message(reply_token, [message])
+
+# --- ฟังก์ชัน Quick Reply ---
+def get_welcome_quick_reply():
+    """สร้าง Quick Reply สำหรับการเริ่มแชท"""
+    return {
+        "items": [
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "แจ้งปัญหา",
+                    "text": "แจ้งปัญหา"
+                }
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "สมัครสมาชิก",
+                    "text": "สมัครสมาชิก"
+                }
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "จบ",
+                    "text": "จบ"
+                }
+            }
+        ]
+    }
+
+def get_main_menu_quick_reply():
+    """สร้าง Quick Reply สำหรับเมนูหลัก"""
+    return {
+        "items": [
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "แจ้งปัญหา",
+                    "text": "แจ้งปัญหา"
+                }
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "แชทกับเจ้าหน้าที่",
+                    "text": "ติดต่อเจ้าหน้าที่"
+                }
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "เช็คสถานะ",
+                    "text": "เช็กสถานะ"
+                }
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "จบ",
+                    "text": "จบ"
+                }
+            }
+        ]
+    }
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8081))
     LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
     GOOGLE_CREDS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    socketio.run(app, host="0.0.0.0", port=port, debug=True)

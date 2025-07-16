@@ -6,3 +6,4 @@ google-auth
 google-auth-oauthlib
 psycopg2-binary
 gunicorn
+flask-socketio

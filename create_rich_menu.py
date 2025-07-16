@@ -3,7 +3,7 @@ import json
 
 
 # 🔐 Channel Access Token จาก LINE Developer Console
-CHANNEL_ACCESS_TOKEN = '0wrW85zf5NXhGWrHRjwxitrZ33JPegxtB749lq9TWRlrlCvfl0CKN9ceTw+kzPqBc6yjEOlV3EJOqUsBNhiFGQu3asN1y6CbHIAkJINhHNWi5gY9+O3+SnvrPaZzI7xbsBuBwe8XdIx33wdAN+79bgdB04t89/1O/w1cDnyilFU='
+CHANNEL_ACCESS_TOKEN = 'O02yXH2dlIyu9da3bJPfhtHTZYkDJR/wy1TnWj5ZAgBUr0zfiNrY9mC3qm5nEWyILuI+rcVftmsvsQZp+AB8Hf6f5UmDosjtkQY0ufX+JrVwa3i+UwlAXa7UvBQ/JBef2pRD4wJ3QttJyLn1nfh1dQdB04t89/1O/w1cDnyilFU='
 
 headers = {
     'Authorization': f'Bearer {CHANNEL_ACCESS_TOKEN}',
@@ -28,7 +28,7 @@ rich_menu_data = {
         # ปุ่ม 2: เช็กสถานะ (แถวล่าง ซ้าย)
         {
             "bounds": {"x": 0, "y": 843, "width": 833, "height": 843},
-            "action": {"type": "message", "text": "เช็กสถานะ"}
+            "action": {"type": "message", "text": "แจ้งปัญหา"}
         },
         # ปุ่ม 3: ติดต่อเจ้าหน้าที่ (แถวล่าง กลาง)
         {
@@ -38,7 +38,7 @@ rich_menu_data = {
         # ปุ่ม 4: แจ้งปัญหา (แถวล่าง ขวา)
         {
             "bounds": {"x": 1667, "y": 843, "width": 833, "height": 843},
-            "action": {"type": "message", "text": "แจ้งปัญหา"}
+            "action": {"type": "message", "text": "เช็กสถานะ"}
         }
     ]
 }
